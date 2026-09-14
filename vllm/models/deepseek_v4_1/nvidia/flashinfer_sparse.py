@@ -915,16 +915,15 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
 
 def _normalize_lse(lse: torch.Tensor, num_heads: int, num_tokens: int) -> torch.Tensor:
     """Adapt a FlashInfer wrapper LSE to merge_attn_states' [NUM_HEADS,
-    NUM_TOKENS] fp32 layout."""
+    NUM_TOKENS] fp32 layout (wrapper returns [num_tokens, num_heads] fp32,
+    natural-log base when planned with return_lse_base_on_e=True)."""
     if lse.dim() == 3:
         lse = lse.squeeze(0)
-    if lse.shape == (num_tokens, num_heads):
-        lse = lse.transpose(0, 1)
-    assert lse.shape == (num_heads, num_tokens), (
-        f"unexpected FlashInfer LSE shape {lse.shape}, expected one of "
-        f"({num_heads}, {num_tokens}) / ({num_tokens}, {num_heads})"
+    assert lse.shape == (num_tokens, num_heads), (
+        f"unexpected FlashInfer LSE shape {tuple(lse.shape)}, expected "
+        f"({num_tokens}, {num_heads})"
     )
-    return lse.float()
+    return lse.transpose(0, 1).float()
 
 
 class DeepseekV4FlashInferSM90Attention(DeepseekV4Attention):
