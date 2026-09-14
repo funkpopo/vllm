@@ -361,17 +361,19 @@ class DeepseekSparseSWAFlashInferSM90MetadataBuilder(
             if getattr(hf_config, "vision_n_layers", 0) > 0
             else 0
         )
-        if self._max_image_tokens > 0:
-            raise NotImplementedError(
-                "FLASHINFER_MLA_SPARSE_DSV41_SM90 does not support the vision "
-                "variant (in-image bidirectional SWA visibility)."
-            )
         self._is_dspark = self.is_dspark
         # Wrapper rows use one fixed stride: the widest index width (the
-        # non-causal DSpark decode width when present, else the window).
+        # non-causal DSpark decode width and/or the vision-widened prefill
+        # width when present, else the window).
         width = self.window_size
         if self._is_dspark:
             width = max(width, self.noncausal_index_width)
+        if self._max_image_tokens > 0:
+            # In-image bidirectional visibility widens prefill index rows to
+            # window_size + max_image_tokens (mirrors prefill_index_width).
+            # Rows past a row's lens are never read, so decode rows tolerate
+            # the wider stride unchanged.
+            width = max(width, self.window_size + self._max_image_tokens)
         num_heads = self.vllm_config.model_config.get_num_attention_heads(
             self.vllm_config.parallel_config
         )
@@ -417,7 +419,21 @@ class DeepseekSparseSWAFlashInferSM90MetadataBuilder(
         fast_build: bool = False,
     ) -> "DeepseekSparseSWAMetadata":
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
-        num_rows, swa_lens = self._swa_lens_host(common_attn_metadata)
+        if self._max_image_tokens > 0 and metadata.prefill_left_visible is not None:
+            # Image spans present: the default builder already computed exact
+            # per-token SWA lens on device, including in-image bidirectional
+            # visibility. Reuse them for the host-side plan (one small D2H
+            # copy) instead of the text-only host formula.
+            num_rows = metadata.num_decode_tokens + metadata.num_prefill_tokens
+            swa_lens = torch.cat(
+                [
+                    metadata.decode_swa_lens[: metadata.num_decode_tokens],
+                    metadata.prefill_swa_lens[: metadata.num_prefill_tokens],
+                ]
+            ).to(torch.int32)
+            swa_lens = swa_lens.cpu()
+        else:
+            num_rows, swa_lens = self._swa_lens_host(common_attn_metadata)
         self.state.plan(num_rows, swa_lens)
         metadata.flashinfer_sm90_swa_state = self.state
         return metadata
