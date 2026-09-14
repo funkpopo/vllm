@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4 FlashInfer sparse MLA backend."""
 
-from typing import TYPE_CHECKING, ClassVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
 
@@ -27,6 +27,7 @@ from vllm.models.deepseek_v4_1.sparse_mla import (
 from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse_sm90 import (
     DeepseekSparseSWAFlashInferSM90Backend,
     DeepseekV4FlashInferSM90SparseBackend,
+    has_flashinfer_sm90_mla_lse,
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
@@ -988,8 +989,6 @@ class DeepseekV4FlashInferSM90Attention(DeepseekV4Attention):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        from vllm.utils.flashinfer import has_flashinfer_sm90_mla_lse
-
         if not has_flashinfer_sm90_mla_lse():
             raise RuntimeError(
                 "FLASHINFER_MLA_SPARSE_DSV41_SM90 requires FlashInfer's SM90 "
