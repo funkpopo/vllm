@@ -1024,6 +1024,14 @@ class DeepseekV4FlashInferSM90Attention(DeepseekV4Attention):
     def _flat_ckv(self, kv_cache: torch.Tensor) -> torch.Tensor:
         # Plain-row caches are contiguous [num_blocks, rows_per_block, 512];
         # slot ids address rows of the flattened tensor (page_size=1).
+        # A non-contiguous view means the pool packs extra pages (e.g. the
+        # indexer cache) inside each block; silently reshaping would copy the
+        # whole pool, so fail loudly instead.
+        assert kv_cache.is_contiguous(), (
+            "FLASHINFER_MLA_SPARSE_DSV41_SM90 requires a contiguous per-layer "
+            "compressed cache; the resolved KV cache layout packs extra pages "
+            f"inside each block (strides={kv_cache.stride()})."
+        )
         return kv_cache.reshape(-1, 1, self.head_dim)
 
     def _run_wrapper(

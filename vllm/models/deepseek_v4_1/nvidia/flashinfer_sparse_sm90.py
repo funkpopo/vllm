@@ -238,7 +238,11 @@ class DeepseekV4FlashInferSM90SparseBackend(DeepseekV4SparseMLABackend):
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
-        return (KVCacheLayout.LBHNC,)
+        # The DSV4.1 pool packs the indexer pages beside the MLA latent pages
+        # inside each block, so the layer dim must sit inside the block dim
+        # (same requirement as DeepseekV4IndexerBackend); the layout is
+        # resolved worker-globally as the intersection of all backends.
+        return (KVCacheLayout.BLHNC, KVCacheLayout.BLNHC)
 
     @staticmethod
     def get_builder_cls() -> type["DeepseekV4FlashInferSM90MetadataBuilder"]:
