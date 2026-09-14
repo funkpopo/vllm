@@ -293,7 +293,7 @@ class DeepseekV4FlashInferSM90MetadataBuilder(DeepseekV4SparseMLAMetadataBuilder
             kv_cache_spec.dtype,
             vllm_config.scheduler_config.max_num_batched_tokens,
             self._index_topk,
-            kv_lora_rank=int(hf_config.kv_lora_rank),
+            kv_lora_rank=attention_layer.head_dim,  # NoPE: full 512-wide row
             qk_rope_head_dim=0,  # NoPE kernel mode: rope folded into ckv
             sm_scale=attention_layer.scale,
         )
