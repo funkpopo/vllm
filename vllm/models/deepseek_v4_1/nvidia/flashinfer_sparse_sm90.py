@@ -118,7 +118,8 @@ def _host_rows(
     req_of_row = torch.repeat_interleave(
         torch.arange(num_reqs, dtype=torch.int64), q_lens
     )
-    row_offset = torch.arange(num_rows, dtype=torch.int64) - q_lens.to(torch.int64)[
+    # Token offset within the request's tokens (rows are decode-first).
+    row_offset = torch.arange(num_rows, dtype=torch.int64) - qsl.to(torch.int64)[
         req_of_row
     ]
     if not async_scheduling and cam.seq_lens_cpu_upper_bound is not None:

@@ -42,7 +42,8 @@ class FakeWrapper:
         self.run_calls.append((q_nope, q_pe, ckv, kpe, kwargs))
         num_tokens, num_heads, head_dim = q_nope.shape
         out = torch.zeros(num_tokens, num_heads, ckv.shape[-1], dtype=torch.bfloat16)
-        lse = torch.full((num_heads, num_tokens), 0.5, dtype=torch.float32)
+        # The real wrapper returns [num_tokens, num_heads] fp32 LSE.
+        lse = torch.full((num_tokens, num_heads), 0.5, dtype=torch.float32)
         return out, lse
 
 
@@ -246,6 +247,7 @@ def test_swa_lens_host_noncausal_dspark():
     )
     cam = SimpleNamespace(
         num_reqs=2,
+        max_query_len=6,
         query_start_loc_cpu=torch.tensor([0, 6, 12], dtype=torch.int32),
         seq_lens=torch.tensor([100, 9], dtype=torch.int32),
         seq_lens_cpu_upper_bound=torch.tensor([100, 9], dtype=torch.int32),
@@ -262,7 +264,10 @@ def test_swa_lens_host_noncausal_dspark():
 
 def test_topk_lens_host_ratio1():
     builder = _make_builder(
-        DeepseekV4FlashInferSM90MetadataBuilder, _index_topk=2048, _async_scheduling=False
+        DeepseekV4FlashInferSM90MetadataBuilder,
+        _index_topk=2048,
+        _async_scheduling=False,
+        compress_ratio=1,
     )
     cam = SimpleNamespace(
         num_reqs=2,
@@ -278,7 +283,10 @@ def test_topk_lens_host_ratio1():
 
 def test_topk_lens_host_ratio2():
     builder = _make_builder(
-        DeepseekV4FlashInferSM90MetadataBuilder, _index_topk=8, _async_scheduling=False
+        DeepseekV4FlashInferSM90MetadataBuilder,
+        _index_topk=8,
+        _async_scheduling=False,
+        compress_ratio=2,
     )
     cam = SimpleNamespace(
         num_reqs=1,
@@ -351,11 +359,6 @@ def test_selection_logic(monkeypatch):
 
     backend = AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV41_SM90
     config = SimpleNamespace(attention_config=SimpleNamespace(backend=backend))
-    monkeypatch.setattr(
-        fi_dsv41_mod,
-        "current_platform",
-        SimpleNamespace(get_device_capability=lambda: DeviceCapability(9, 0)),
-    )
     import vllm.models.deepseek_v4_1.nvidia.model as model_mod
 
     monkeypatch.setattr(
