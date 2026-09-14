@@ -41,7 +41,7 @@ class FakeWrapper:
     def run(self, q_nope, q_pe, ckv, kpe, **kwargs):
         self.run_calls.append((q_nope, q_pe, ckv, kpe, kwargs))
         num_tokens, num_heads, head_dim = q_nope.shape
-        out = torch.zeros(num_tokens, num_heads, ckv.shape[-1], dtype=torch.bfloat16)
+        out = torch.ones(num_tokens, num_heads, ckv.shape[-1], dtype=torch.bfloat16)
         # The real wrapper returns [num_tokens, num_heads] fp32 LSE.
         lse = torch.full((num_tokens, num_heads), 0.5, dtype=torch.float32)
         return out, lse
@@ -194,6 +194,10 @@ def test_swa_only_single_call(monkeypatch):
     assert merged_calls == []
     rows_a = swa_state.kv_indices.view(-1, swa_state.topk_width)[:ndt]
     assert (rows_a[:, :WINDOW] == torch.arange(ndt * WINDOW).reshape(ndt, WINDOW)).all()
+    # Sink correction math: wrapper out=1, lse=0.5, sink=0 →
+    # out * sigmoid(lse - sink) = sigmoid(0.5).
+    expected = torch.sigmoid(torch.tensor(0.5))
+    assert torch.allclose(output, output.new_full(output.shape, expected))
 
 
 def test_run_wrapper_args():

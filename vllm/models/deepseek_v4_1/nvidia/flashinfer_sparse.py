@@ -1063,7 +1063,7 @@ class DeepseekV4FlashInferSM90Attention(DeepseekV4Attention):
         (-inf) leave the output untouched.
         """
         scale = torch.sigmoid(lse - self.attn_sink.unsqueeze(1))
-        out.mul_(scale.unsqueeze(-1).to(out.dtype))
+        out.mul_(scale.transpose(0, 1).unsqueeze(-1).to(out.dtype))
 
     def forward_mqa(
         self,
