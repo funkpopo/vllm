@@ -205,6 +205,18 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         """Return whether this instance stores fp8 KV in fp8_ds_mla layout."""
         return self.use_fp8_ds_mla_layout
 
+    @classmethod
+    def _canonicalize_kv_cache_dtype(
+        cls, kv_cache_dtype: str, cache_config: CacheConfig | None
+    ) -> str:
+        """Map the CLI ``--kv-cache-dtype`` value before layout resolution.
+
+        Base behavior keeps the value as-is (``fp8`` resolves to plain
+        per-tensor E4M3 on the plain-row path); backends can override, e.g. to
+        default ``auto`` to FP8 like the fp8_ds_mla layout does.
+        """
+        return kv_cache_dtype
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -443,7 +455,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # Resolve the kv-cache dtype from this backend's block format. The same
         # resolution drives the SWA cache tensor dtype below.
         self.kv_cache_dtype, self.kv_cache_torch_dtype = _resolve_dsv4_kv_cache_dtype(
-            self._uses_fp8_ds_mla_layout(), cache_config.cache_dtype, cache_config
+            self._uses_fp8_ds_mla_layout(),
+            self._canonicalize_kv_cache_dtype(cache_config.cache_dtype, cache_config),
+            cache_config,
         )
 
         self.swa_cache_layer = DeepseekV4SWACache(

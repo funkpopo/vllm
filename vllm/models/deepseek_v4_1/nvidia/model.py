@@ -66,6 +66,7 @@ from vllm.models.deepseek_v4_1.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferMLAAttention,
     DeepseekV4FlashInferSM120Attention,
+    DeepseekV4FlashInferSM90Attention,
 )
 from vllm.models.deepseek_v4_1.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.platforms import current_platform
@@ -124,12 +125,21 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     if backend in (
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
+        AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
     ):
         raise ValueError(
             f"{backend.name} is not a DeepSeek V4.1 attention backend. "
-            "Use FLASHINFER_MLA_SPARSE_DSV41 for DeepSeek V4.1 FlashInfer "
-            "sparse MLA."
+            "Use FLASHINFER_MLA_SPARSE_DSV41 (SM10x/SM12x) or "
+            "FLASHINFER_MLA_SPARSE_DSV41_SM90 (SM90) for DeepSeek V4.1 "
+            "FlashInfer sparse MLA."
         )
+    if backend == AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV41_SM90:
+        if device_capability is not None and device_capability.major != 9:
+            raise ValueError(
+                "FLASHINFER_MLA_SPARSE_DSV41_SM90 requires an SM90 (Hopper) "
+                f"GPU, got major={device_capability.major}"
+            )
+        return DeepseekV4FlashInferSM90Attention
     if backend in (
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV4,
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV41,

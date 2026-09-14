@@ -24,6 +24,10 @@ from vllm.models.deepseek_v4_1.sparse_mla import (
     DeepseekV4SparseMLAMetadataBuilder,
     DeepseekV41SparseSWAMetadataBuilder,
 )
+from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse_sm90 import (
+    DeepseekSparseSWAFlashInferSM90Backend,
+    DeepseekV4FlashInferSM90SparseBackend,
+)
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
 from vllm.v1.attention.backend import AttentionCGSupport, MultipleOf
@@ -31,6 +35,7 @@ from vllm.v1.attention.backends.mla.compressor_utils import (
     get_dspark_swa_index_width,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
+from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
@@ -906,3 +911,275 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 extra_sparse_indices=extra_sparse_indices_chunk,
                 extra_sparse_topk_lens=extra_sparse_lengths_chunk,
             )
+
+
+def _normalize_lse(lse: torch.Tensor, num_heads: int, num_tokens: int) -> torch.Tensor:
+    """Adapt a FlashInfer wrapper LSE to merge_attn_states' [NUM_HEADS,
+    NUM_TOKENS] fp32 layout."""
+    if lse.dim() == 3:
+        lse = lse.squeeze(0)
+    if lse.shape == (num_tokens, num_heads):
+        lse = lse.transpose(0, 1)
+    assert lse.shape == (num_heads, num_tokens), (
+        f"unexpected FlashInfer LSE shape {lse.shape}, expected one of "
+        f"({num_heads}, {num_tokens}) / ({num_tokens}, {num_heads})"
+    )
+    return lse.float()
+
+
+class DeepseekV4FlashInferSM90Attention(DeepseekV4Attention):
+    """DeepSeek V4.1 sparse MLA through FlashInfer's SM90 FA2/FA3 MLA kernel.
+
+    The SM90 ``BatchMLAPagedAttentionWrapper`` supports a single KV cache per
+    call, while every v4.1 layer reads both the SWA cache (sliding window) and
+    — for compress_ratio > 0 layers — the compressed cache (indexer top-k).
+    Each layer therefore runs two wrapper calls over the same queries and
+    merges the partial outputs with ``merge_attn_states`` (LSE rescaling);
+    attention sinks are applied after the merge as an exact post-correction.
+
+    The wrapper is planned host-side by the metadata builders every step
+    (outside CUDA graph capture); the forward only refreshes the reserved
+    index buffers with this step's SWA / top-k slot ids.
+    """
+
+    backend_cls = DeepseekV4FlashInferSM90SparseBackend
+    swa_backend_cls = DeepseekSparseSWAFlashInferSM90Backend
+    use_fp8_ds_mla_layout: ClassVar[bool] = False
+
+    @classmethod
+    def get_padded_num_q_heads(cls, num_heads: int) -> int:
+        # The FA2/FA3 MLA wrapper takes arbitrary head counts.
+        return num_heads
+
+    @classmethod
+    def _canonicalize_kv_cache_dtype(cls, kv_cache_dtype: str) -> str:
+        # Plain per-tensor FP8 by default (the FlashMLA path canonicalizes
+        # to fp8_ds_mla instead); `auto` follows the fp8 default.
+        return "fp8" if kv_cache_dtype == "auto" else kv_cache_dtype
+
+    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        return deep_gemm_fp8_o_proj(
+            o,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            self.wo_a,
+            self.wo_b,
+            n_groups=self.n_local_groups,
+            heads_per_group=self.n_local_heads // self.n_local_groups,
+            nope_dim=self.nope_head_dim,
+            rope_dim=self.rope_head_dim,
+            o_lora_rank=self.o_lora_rank,
+            einsum_recipe=self._einsum_recipe,
+            tma_aligned_scales=self._tma_aligned_scales,
+        )
+
+    @classmethod
+    def _canonicalize_kv_cache_dtype(
+        cls, kv_cache_dtype: str, cache_config: Any
+    ) -> str:
+        # Plain per-tensor FP8 KV (the FlashMLA path canonicalizes to
+        # fp8_ds_mla instead); `auto` follows the fp8 default so the CLI needs
+        # no change, and the written-back dtype keeps the SWA cache spec in
+        # sync with the compressed cache.
+        if kv_cache_dtype == "auto":
+            if cache_config is not None:
+                cache_config.cache_dtype = "fp8"
+            return "fp8"
+        return kv_cache_dtype
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        from vllm.utils.flashinfer import has_flashinfer_sm90_mla_lse
+
+        if not has_flashinfer_sm90_mla_lse():
+            raise RuntimeError(
+                "FLASHINFER_MLA_SPARSE_DSV41_SM90 requires FlashInfer's SM90 "
+                "MLA wrapper with return_lse support (>= 0.6.18); install a "
+                "compatible FlashInfer build."
+            )
+        self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe(
+            self._o_proj_block_size
+        )
+        # Per-tensor FP8 scale buffers (queries are dequantized to bf16 before
+        # the wrapper; the cache rows carry the kv scale).
+        if self.kv_cache_torch_dtype != torch.float8_e4m3fn:
+            return
+        fp8_q_scale = 1.0
+        fp8_kv_scale = 1.0
+        self.register_buffer(
+            "_flashinfer_fp8_q_scale",
+            torch.tensor([fp8_q_scale], dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_flashinfer_fp8_q_scale_inv",
+            torch.tensor([1.0 / fp8_q_scale], dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_flashinfer_fp8_kv_scale",
+            torch.tensor([fp8_kv_scale], dtype=torch.float32),
+            persistent=False,
+        )
+        self._sm90_ckv_scale = float(fp8_kv_scale)
+
+    def _flat_ckv(self, kv_cache: torch.Tensor) -> torch.Tensor:
+        # Plain-row caches are contiguous [num_blocks, rows_per_block, 512];
+        # slot ids address rows of the flattened tensor (page_size=1).
+        return kv_cache.reshape(-1, 1, self.head_dim)
+
+    def _run_wrapper(
+        self,
+        state: Any,
+        q: torch.Tensor,
+        ckv: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One wrapper call (NoPE kernel mode: the full 512-wide row is the
+        ckv dim, kpe = 0). Returns (output, lse) with the LSE normalized to
+        [num_heads, num_tokens] fp32."""
+        q_pe = q[..., :0]
+        scale_kwargs = (
+            {"ckv_scale": self._sm90_ckv_scale, "kpe_scale": 1.0}
+            if self.kv_cache_torch_dtype == torch.float8_e4m3fn
+            else {}
+        )
+        out, lse = state.wrapper.run(
+            q, q_pe, ckv, ckv[..., :0], return_lse=True, **scale_kwargs
+        )
+        lse = _normalize_lse(lse, self.n_local_heads, q.shape[0])
+        return out, lse
+
+    def _apply_sink_correction(self, out: torch.Tensor, lse: torch.Tensor) -> None:
+        """out *= 1 / (1 + exp(sink - lse)) = sigmoid(lse - sink).
+
+        The wrapper calls ran without sinks, so lse is the natural log of the
+        softmax denominator over the selected rows only; the sink term adds
+        exp(sink) to the denominator with no value vector. Padded sink slots
+        (-inf) leave the output untouched.
+        """
+        scale = torch.sigmoid(lse - self.attn_sink.unsqueeze(1))
+        out.mul_(scale.unsqueeze(-1).to(out.dtype))
+
+    def forward_mqa(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        assert output.shape == q.shape, (
+            f"output buffer shape {output.shape} must match q shape {q.shape}"
+        )
+        forward_context = get_forward_context()
+        attn_metadata = forward_context.attn_metadata
+        if attn_metadata is None:
+            # Warmup dummy run: the wrapper states live in the metadata
+            # builders; nothing to reserve here.
+            output.zero_()
+            return
+
+        assert isinstance(attn_metadata, dict)
+        # Compressed-cache metadata lives on the kv-source layer's prefix;
+        # consumers share that cache and its block table.
+        flashmla_metadata = cast(
+            DeepseekV4FlashMLAMetadata | None,
+            attn_metadata.get(self.compressed_cache_prefix)
+            if self.compressed_cache_prefix is not None
+            else None,
+        )
+        swa_metadata = cast(
+            "DeepseekSparseSWAMetadata | None",
+            attn_metadata.get(self.swa_cache_layer.prefix),
+        )
+        assert swa_metadata is not None
+        swa_state = swa_metadata.flashinfer_sm90_swa_state
+        assert swa_state is not None, (
+            "the SWA metadata must be built by "
+            "DeepseekSparseSWAFlashInferSM90MetadataBuilder"
+        )
+
+        swa_only = self.compress_ratio == 0
+        topk_state = (
+            None if swa_only else flashmla_metadata.flashinfer_sm90_topk_state
+        )
+        if not swa_only:
+            assert flashmla_metadata is not None
+            assert topk_state is not None, (
+                "compressed layers require SM90 sparse metadata with a "
+                "planned top-k wrapper state"
+            )
+
+        num_decode_tokens = swa_metadata.num_decode_tokens
+        num_prefill_tokens = swa_metadata.num_prefill_tokens
+        num_tokens = num_decode_tokens + num_prefill_tokens
+        if num_tokens == 0:
+            return
+
+        q = q[:num_tokens]
+        output = output[:num_tokens]
+        if q.dtype == torch.float8_e4m3fn:
+            # Per-tensor quantized query (scales are 1.0); the SM90 kernel
+            # takes bf16 queries and dequantizes the FP8 cache in-kernel.
+            q = q.to(torch.bfloat16)
+        q = q.contiguous()
+
+        # ---- Call A: sliding-window rows (page_size=1 over the SWA cache).
+        width_a = swa_state.topk_width
+        rows_a = swa_state.kv_indices.view(-1, width_a)
+        if num_decode_tokens > 0:
+            decode_indices = swa_metadata.decode_swa_indices
+            assert decode_indices is not None
+            decode_indices = decode_indices.reshape(num_decode_tokens, -1)
+            rows_a[:num_decode_tokens, : decode_indices.shape[1]].copy_(decode_indices)
+        if num_prefill_tokens > 0:
+            prefill_indices = swa_metadata.prefill_swa_indices
+            assert prefill_indices is not None
+            prefill_indices = prefill_indices.reshape(num_prefill_tokens, -1)
+            rows_a[
+                num_decode_tokens:num_tokens, : prefill_indices.shape[1]
+            ].copy_(prefill_indices)
+        # Refresh in graph; clamp masked tails to a valid slot (rows past the
+        # planned per-row lengths are never read).
+        swa_state.kv_indices[: num_tokens * width_a].clamp_(min=0)
+
+        swa_cache = self.swa_cache_layer.kv_cache
+        out_a, lse_a = self._run_wrapper(swa_state, q, self._flat_ckv(swa_cache))
+
+        if swa_only:
+            output.copy_(out_a)
+            lse = lse_a
+        else:
+            # ---- call B: compressed top-k rows.
+            assert flashmla_metadata is not None and topk_state is not None
+            assert swa_metadata.is_valid_token is not None
+            num_reqs = flashmla_metadata.num_reqs
+            block_size = flashmla_metadata.block_size // self.compress_ratio
+            global_topk, _topk_lens = compute_global_topk_indices_and_lens(
+                self.topk_indices_buffer[:num_tokens],
+                swa_metadata.token_to_req_indices[:num_tokens],
+                flashmla_metadata.block_table[: flashmla_metadata.num_reqs],
+                block_size,
+                swa_metadata.is_valid_token[:num_tokens],
+            )
+            width_b = topk_state.topk_width
+            rows_b = topk_state.kv_indices.view(-1, width_b)
+            rows_b[:num_tokens].copy_(global_topk)
+            rows_b[:num_tokens].clamp_(min=0)
+
+            ckv = self._flat_ckv(self._compressed_kv_cache())
+            out_b, lse_b = self._run_wrapper(topk_state, q, ckv)
+
+            # LSE rescaling merge, mathematically equivalent to FlashMLA's
+            # fused SWA + top-k single call.
+            merged_lse = torch.empty_like(lse_a)
+            merge_attn_states(
+                output,
+                out_a,
+                lse_a,
+                out_b,
+                lse_b,
+                output_lse=merged_lse,
+            )
+            lse = merged_lse
+
+        self._apply_sink_correction(output, lse)

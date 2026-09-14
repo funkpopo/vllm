@@ -218,6 +218,10 @@ class DeepseekSparseSWAMetadata:
     flashinfer_sparse_index_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = field(
         default_factory=dict
     )
+    # FlashInfer SM90 two-call backend: builder-owned wrapper state for the
+    # sliding-window call (planned outside CUDA graph capture every step).
+    # Only set by DeepseekSparseSWAFlashInferSM90MetadataBuilder.
+    flashinfer_sm90_swa_state: Any | None = None
 
     def get_prefill_chunk_plan(
         self,

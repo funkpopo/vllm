@@ -139,6 +139,10 @@ class DeepseekV4FlashMLAMetadata(AttentionMetadata):
     req_id_per_token: torch.Tensor
     block_size: int
     topk_tokens: int
+    # FlashInfer SM90 two-call backend: builder-owned wrapper state for the
+    # compressed-cache (top-k) call, planned outside CUDA graph capture every
+    # step. Only set by DeepseekV4FlashInferSM90MetadataBuilder.
+    flashinfer_sm90_topk_state: Any | None = None
 
 
 class DeepseekV4SparseMLAMetadataBuilder(
