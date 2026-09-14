@@ -1211,6 +1211,8 @@ class DeepseekV4FlashInferSM90Attention(DeepseekV4Attention):
         else:
             # ---- call B: compressed top-k rows.
             assert flashmla_metadata is not None and topk_state is not None
+            assert self.topk_indices_buffer is not None
+            assert swa_metadata.token_to_req_indices is not None
             assert swa_metadata.is_valid_token is not None
             block_size = flashmla_metadata.block_size // self.compress_ratio
             global_topk, _topk_lens = compute_global_topk_indices_and_lens(

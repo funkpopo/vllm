@@ -145,7 +145,9 @@ def test_two_call_mixed_batch(monkeypatch):
         output.copy_(p_out + s_out)
 
     monkeypatch.setattr(fi_dsv41_mod, "merge_attn_states", fake_merge)
-    monkeypatch.setattr(type(attn), "_apply_sink_correction", lambda self, out, lse: None)
+    monkeypatch.setattr(
+        type(attn), "_apply_sink_correction", lambda self, out, lse: None
+    )
 
     q = torch.randn(num_tokens, NUM_HEADS, BLOCK, dtype=torch.bfloat16)
     output = torch.zeros_like(q)
@@ -383,22 +385,24 @@ def test_interleaved_cache_page_indices_alias_original_rows(dtype):
     torch.testing.assert_close(selected, expected, rtol=0, atol=0)
 
 
-class ReferenceWrapper:
+class ReferenceWrapper(FakeWrapper):
     """Compute partial attention from the pages passed by forward_mqa."""
 
     def __init__(self, state, lengths):
+        super().__init__()
         self.state = state
         self.lengths = lengths
 
-    def run(self, q, q_pe, ckv, kpe, **kwargs):
-        out = torch.zeros_like(q)
-        lse = torch.full(q.shape[:2], -torch.inf, device=q.device)
+    def run(self, q_nope, q_pe, ckv, kpe, **kwargs):
+        self.run_calls.append((q_nope, q_pe, ckv, kpe, kwargs))
+        out = torch.zeros_like(q_nope)
+        lse = torch.full(q_nope.shape[:2], -torch.inf, device=q_nope.device)
         indices = self.state.kv_indices.view(-1, self.state.topk_width)
         for row, length in enumerate(self.lengths):
             if length == 0:
                 continue
             kv = ckv.float()[indices[row, :length].long(), 0]
-            logits = q[row].float() @ kv.T * BLOCK**-0.5
+            logits = q_nope[row].float() @ kv.T * BLOCK**-0.5
             out[row] = (logits.softmax(-1) @ kv).to(out.dtype)
             lse[row] = logits.logsumexp(-1)
         return out, lse
