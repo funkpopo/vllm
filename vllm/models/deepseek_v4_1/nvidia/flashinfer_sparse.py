@@ -1044,7 +1044,14 @@ class DeepseekV4FlashInferSM90Attention(DeepseekV4Attention):
             else {}
         )
         out, lse = state.wrapper.run(
-            q, q_pe, ckv, ckv[..., :0], return_lse=True, **scale_kwargs
+            q,
+            q_pe,
+            ckv,
+            ckv[..., :0],
+            return_lse=True,
+            # merge_attn_states rescales with exp(), i.e. natural-log LSE.
+            return_lse_base_on_e=True,
+            **scale_kwargs,
         )
         lse = _normalize_lse(lse, self.n_local_heads, q.shape[0])
         return out, lse
