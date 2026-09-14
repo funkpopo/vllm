@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """DeepSeek V4 FlashInfer sparse MLA backend."""
 
+from math import gcd
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
 import torch
@@ -18,16 +19,17 @@ from vllm.models.deepseek_v4_1.common.ops import (
     build_flashinfer_mixed_sparse_indices,
     compute_global_topk_indices_and_lens,
 )
+from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse_sm90 import (
+    DeepseekSparseSWAFlashInferSM90Backend,
+    DeepseekV4FlashInferSM90SparseBackend,
+    _copy_page_indices_kernel,
+    has_flashinfer_sm90_mla_lse,
+)
 from vllm.models.deepseek_v4_1.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
     DeepseekV4SparseMLABackend,
     DeepseekV4SparseMLAMetadataBuilder,
     DeepseekV41SparseSWAMetadataBuilder,
-)
-from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse_sm90 import (
-    DeepseekSparseSWAFlashInferSM90Backend,
-    DeepseekV4FlashInferSM90SparseBackend,
-    has_flashinfer_sm90_mla_lse,
 )
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
@@ -945,17 +947,12 @@ class DeepseekV4FlashInferSM90Attention(DeepseekV4Attention):
     backend_cls = DeepseekV4FlashInferSM90SparseBackend
     swa_backend_cls = DeepseekSparseSWAFlashInferSM90Backend
     use_fp8_ds_mla_layout: ClassVar[bool] = False
+    fp8_cache_query_dtype: ClassVar[torch.dtype] = torch.bfloat16
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
         # The FA2/FA3 MLA wrapper takes arbitrary head counts.
         return num_heads
-
-    @classmethod
-    def _canonicalize_kv_cache_dtype(cls, kv_cache_dtype: str) -> str:
-        # Plain per-tensor FP8 by default (the FlashMLA path canonicalizes
-        # to fp8_ds_mla instead); `auto` follows the fp8 default.
-        return "fp8" if kv_cache_dtype == "auto" else kv_cache_dtype
 
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         return deep_gemm_fp8_o_proj(
@@ -981,6 +978,11 @@ class DeepseekV4FlashInferSM90Attention(DeepseekV4Attention):
         # fp8_ds_mla instead); `auto` follows the fp8 default so the CLI needs
         # no change, and the written-back dtype keeps the SWA cache spec in
         # sync with the compressed cache.
+        if kv_cache_dtype not in ("auto", "bfloat16", "fp8", "fp8_e4m3"):
+            raise ValueError(
+                "FLASHINFER_MLA_SPARSE_DSV41_SM90 requires plain BF16/FP8 KV; "
+                f"got {kv_cache_dtype}."
+            )
         if kv_cache_dtype == "auto":
             if cache_config is not None:
                 cache_config.cache_dtype = "fp8"
@@ -998,8 +1000,7 @@ class DeepseekV4FlashInferSM90Attention(DeepseekV4Attention):
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe(
             self._o_proj_block_size
         )
-        # Per-tensor FP8 scale buffers (queries are dequantized to bf16 before
-        # the wrapper; the cache rows carry the kv scale).
+        # The insert kernel keeps BF16 queries and quantizes only the KV rows.
         if self.kv_cache_torch_dtype != torch.float8_e4m3fn:
             return
         fp8_q_scale = 1.0
@@ -1021,18 +1022,59 @@ class DeepseekV4FlashInferSM90Attention(DeepseekV4Attention):
         )
         self._sm90_ckv_scale = float(fp8_kv_scale)
 
-    def _flat_ckv(self, kv_cache: torch.Tensor) -> torch.Tensor:
-        # Plain-row caches are contiguous [num_blocks, rows_per_block, 512];
-        # slot ids address rows of the flattened tensor (page_size=1).
-        # A non-contiguous view means the pool packs extra pages (e.g. the
-        # indexer cache) inside each block; silently reshaping would copy the
-        # whole pool, so fail loudly instead.
-        assert kv_cache.is_contiguous(), (
-            "FLASHINFER_MLA_SPARSE_DSV41_SM90 requires a contiguous per-layer "
-            "compressed cache; the resolved KV cache layout packs extra pages "
-            f"inside each block (strides={kv_cache.stride()})."
+    def _flat_ckv(self, kv_cache: torch.Tensor) -> tuple[torch.Tensor, int, int]:
+        """View interleaved cache blocks as single-token FlashInfer pages.
+
+        Only remapped pages are read. The page stride can be smaller than a
+        row when a BF16 cache shares 512-byte-aligned blocks with the indexer.
+        """
+        num_blocks, block_size, head_dim = kv_cache.shape
+        assert head_dim == self.head_dim and kv_cache.stride(2) == 1
+        block_stride, token_stride, _ = kv_cache.stride()
+        page_stride = gcd(block_stride, token_stride)
+        block_stride_pages = block_stride // page_stride
+        token_stride_pages = token_stride // page_stride
+        num_pages = (
+            (num_blocks - 1) * block_stride_pages
+            + (block_size - 1) * token_stride_pages
+            + 1
         )
-        return kv_cache.reshape(-1, 1, self.head_dim)
+        assert 0 < num_pages <= torch.iinfo(torch.int32).max
+        ckv = kv_cache.as_strided(
+            (num_pages, 1, head_dim), (page_stride, token_stride, 1)
+        )
+        return ckv, block_stride_pages, token_stride_pages
+
+    @staticmethod
+    def _copy_page_indices(
+        dest: torch.Tensor,
+        slots: torch.Tensor,
+        block_size: int,
+        block_stride: int,
+        token_stride: int,
+    ) -> None:
+        """Map logical slots to physical pages without copying KV data."""
+        if slots.is_cuda:
+            _copy_page_indices_kernel[((slots.numel() + 1023) // 1024,)](
+                dest,
+                slots,
+                slots.numel(),
+                slots.shape[1],
+                slots.stride(0),
+                dest.stride(0),
+                block_size,
+                block_stride,
+                token_stride,
+                1024,
+            )
+            return
+        slots = slots.clamp(min=0)
+        if block_stride != block_size or token_stride != 1:
+            slots = (
+                torch.div(slots, block_size, rounding_mode="floor") * block_stride
+                + slots.remainder(block_size) * token_stride
+            )
+        dest.copy_(slots)
 
     def _run_wrapper(
         self,
@@ -1071,6 +1113,7 @@ class DeepseekV4FlashInferSM90Attention(DeepseekV4Attention):
         (-inf) leave the output untouched.
         """
         scale = torch.sigmoid(lse - self.attn_sink.unsqueeze(1))
+        scale.masked_fill_(torch.isneginf(lse), 0)
         out.mul_(scale.transpose(0, 1).unsqueeze(-1).to(out.dtype))
 
     def forward_mqa(
@@ -1112,11 +1155,10 @@ class DeepseekV4FlashInferSM90Attention(DeepseekV4Attention):
         )
 
         swa_only = self.compress_ratio == 0
-        topk_state = (
-            None if swa_only else flashmla_metadata.flashinfer_sm90_topk_state
-        )
+        topk_state = None
         if not swa_only:
             assert flashmla_metadata is not None
+            topk_state = flashmla_metadata.flashinfer_sm90_topk_state
             assert topk_state is not None, (
                 "compressed layers require SM90 sparse metadata with a "
                 "planned top-k wrapper state"
@@ -1130,33 +1172,38 @@ class DeepseekV4FlashInferSM90Attention(DeepseekV4Attention):
 
         q = q[:num_tokens]
         output = output[:num_tokens]
-        if q.dtype == torch.float8_e4m3fn:
-            # Per-tensor quantized query (scales are 1.0); the SM90 kernel
-            # takes bf16 queries and dequantizes the FP8 cache in-kernel.
-            q = q.to(torch.bfloat16)
+        assert q.dtype == torch.bfloat16
         q = q.contiguous()
 
         # ---- Call A: sliding-window rows (page_size=1 over the SWA cache).
+        swa_cache = self.swa_cache_layer.kv_cache
+        ckv_a, block_stride_a, token_stride_a = self._flat_ckv(swa_cache)
         width_a = swa_state.topk_width
         rows_a = swa_state.kv_indices.view(-1, width_a)
         if num_decode_tokens > 0:
             decode_indices = swa_metadata.decode_swa_indices
             assert decode_indices is not None
             decode_indices = decode_indices.reshape(num_decode_tokens, -1)
-            rows_a[:num_decode_tokens, : decode_indices.shape[1]].copy_(decode_indices)
+            self._copy_page_indices(
+                rows_a[:num_decode_tokens, : decode_indices.shape[1]],
+                decode_indices,
+                swa_cache.shape[1],
+                block_stride_a,
+                token_stride_a,
+            )
         if num_prefill_tokens > 0:
             prefill_indices = swa_metadata.prefill_swa_indices
             assert prefill_indices is not None
             prefill_indices = prefill_indices.reshape(num_prefill_tokens, -1)
-            rows_a[
-                num_decode_tokens:num_tokens, : prefill_indices.shape[1]
-            ].copy_(prefill_indices)
-        # Refresh in graph; clamp masked tails to a valid slot (rows past the
-        # planned per-row lengths are never read).
-        swa_state.kv_indices[: num_tokens * width_a].clamp_(min=0)
+            self._copy_page_indices(
+                rows_a[num_decode_tokens:num_tokens, : prefill_indices.shape[1]],
+                prefill_indices,
+                swa_cache.shape[1],
+                block_stride_a,
+                token_stride_a,
+            )
 
-        swa_cache = self.swa_cache_layer.kv_cache
-        out_a, lse_a = self._run_wrapper(swa_state, q, self._flat_ckv(swa_cache))
+        out_a, lse_a = self._run_wrapper(swa_state, q, ckv_a)
 
         if swa_only:
             output.copy_(out_a)
@@ -1165,7 +1212,6 @@ class DeepseekV4FlashInferSM90Attention(DeepseekV4Attention):
             # ---- call B: compressed top-k rows.
             assert flashmla_metadata is not None and topk_state is not None
             assert swa_metadata.is_valid_token is not None
-            num_reqs = flashmla_metadata.num_reqs
             block_size = flashmla_metadata.block_size // self.compress_ratio
             global_topk, _topk_lens = compute_global_topk_indices_and_lens(
                 self.topk_indices_buffer[:num_tokens],
@@ -1176,10 +1222,16 @@ class DeepseekV4FlashInferSM90Attention(DeepseekV4Attention):
             )
             width_b = topk_state.topk_width
             rows_b = topk_state.kv_indices.view(-1, width_b)
-            rows_b[:num_tokens].copy_(global_topk)
-            rows_b[:num_tokens].clamp_(min=0)
-
-            ckv = self._flat_ckv(self._compressed_kv_cache())
+            ckv, block_stride_b, token_stride_b = self._flat_ckv(
+                self._compressed_kv_cache()
+            )
+            self._copy_page_indices(
+                rows_b[:num_tokens],
+                global_topk,
+                block_size,
+                block_stride_b,
+                token_stride_b,
+            )
             out_b, lse_b = self._run_wrapper(topk_state, q, ckv)
 
             # LSE rescaling merge, mathematically equivalent to FlashMLA's

@@ -25,11 +25,10 @@ DSV4.1 differs from the generic SM90 NoPE backend
 
 The wrapper bakes per-row KV lengths into its host-side schedule at plan()
 time, so both builders replan every step outside CUDA graph capture with
-exact host-side lengths (see ``_SM90State.plan`` for why inexact lengths
-illegal-address). Lengths are derived from the same formulas as the device
-index kernels: SWA rows are ``min(ctx, window)`` (causal) or
-``min(seq_len, window + q_len)`` (DSpark non-causal draft rows); compressed
-rows are ``min(index_topk, ctx // compress_ratio)``.
+exact lengths copied from the device. SWA counts come from the index
+kernels; compressed counts are ``min(index_topk, ctx // compress_ratio)``,
+masked by the slot mapping. CPU sequence-length upper bounds and query
+boundaries can differ from the device under speculative decoding.
 
 Sink handling: attention sinks are applied after the merge as an exact
 post-correction (``scale = sigmoid(lse - sink)`` per head), whether the
@@ -37,8 +36,8 @@ wrapper natively supports sinks or not; the planned calls always run without
 sinks so the returned LSE excludes the sink term.
 
 CUDA-graph: both builders own ``_SM90State`` wrappers with reserved
-capture-stable buffers and plan in ``build()`` (always eager); captured
-forward runs refresh only the index contents.
+capture-stable buffers and plan in ``build()`` (always eager). The model
+currently runs sparse attention in an eager region of breakable graphs.
 """
 
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -48,12 +47,13 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.models.deepseek_v4_1.sparse_mla import (
-    DeepseekV41SparseSWAMetadataBuilder,
     DeepseekV4FlashMLAMetadata,
     DeepseekV4SparseMLABackend,
     DeepseekV4SparseMLAMetadataBuilder,
+    DeepseekV41SparseSWAMetadataBuilder,
 )
 from vllm.platforms.interface import DeviceCapability
+from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import has_flashinfer_sm90_nope_mla
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
@@ -62,11 +62,32 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm90 import _SM90State
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWABackend
-from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import KVCacheLayout
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+
+
+@triton.jit(do_not_specialize=["num_indices"])
+def _copy_page_indices_kernel(
+    dest,
+    slots,
+    num_indices,
+    width: tl.constexpr,
+    src_stride: tl.constexpr,
+    dst_stride: tl.constexpr,
+    block_size: tl.constexpr,
+    block_stride: tl.constexpr,
+    token_stride: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    offset = tl.program_id(0) * TILE + tl.arange(0, TILE)
+    row = (offset // width).to(tl.int64)
+    col = offset % width
+    slot = tl.load(slots + row * src_stride + col, offset < num_indices, other=0)
+    slot = tl.maximum(slot, 0).to(tl.int64)
+    page = slot // block_size * block_stride + slot % block_size * token_stride
+    tl.store(dest + row * dst_stride + col, page, offset < num_indices)
 
 
 def has_flashinfer_sm90_mla_lse() -> bool:
@@ -87,51 +108,7 @@ def has_flashinfer_sm90_mla_lse() -> bool:
         params = inspect.signature(BatchMLAPagedAttentionWrapper.run).parameters
     except (TypeError, ValueError):
         return False
-    return "return_lse" in params
-
-
-def _decode_threshold(vllm_config: VllmConfig) -> int:
-    """Decode/query-length split threshold, mirroring the SWA builder."""
-    spec_config = vllm_config.speculative_config
-    num_spec = spec_config.num_speculative_tokens if spec_config else 0
-    spec_mult = 2 if (spec_config is not None and spec_config.parallel_drafting) else 1
-    return 1 + spec_mult * num_spec
-
-
-def _host_rows(
-    cam: CommonAttentionMetadata,
-    async_scheduling: bool,
-) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
-    """Per-row host tensors for the scheduled batch: ``(num_rows, positions,
-    seq_lens, q_lens, req_of_row)`` (int64 CPU).
-
-    ``positions`` is exact: derived from the maintained host seq-lens upper
-    bound when scheduling is synchronous, otherwise from the device positions
-    at the cost of one D2H sync per metadata build.
-    """
-    num_reqs = cam.num_reqs
-    qsl = cam.query_start_loc_cpu[: num_reqs + 1]
-    num_rows = int(qsl[-1])
-    if num_rows == 0:
-        return None
-    q_lens = (qsl[1:] - qsl[:-1]).to(torch.int64)
-    req_of_row = torch.repeat_interleave(
-        torch.arange(num_reqs, dtype=torch.int64), q_lens
-    )
-    # Token offset within the request's tokens (rows are decode-first).
-    row_offset = torch.arange(num_rows, dtype=torch.int64) - qsl.to(torch.int64)[
-        req_of_row
-    ]
-    if not async_scheduling and cam.seq_lens_cpu_upper_bound is not None:
-        seq_lens = cam.seq_lens_cpu_upper_bound[:num_reqs].to(torch.int64)
-        positions = (seq_lens - q_lens)[req_of_row] + row_offset
-    elif cam.positions is not None and num_rows <= cam.positions.shape[0]:
-        positions = cam.positions[:num_rows].cpu().to(torch.int64)
-        seq_lens = cam.seq_lens[:num_reqs].cpu().to(torch.int64)
-    else:
-        seq_lens = cam.seq_lens[:num_reqs].cpu().to(torch.int64)
-        positions = (seq_lens - q_lens)[req_of_row] + row_offset
-    return num_rows, positions, seq_lens, q_lens, req_of_row
+    return {"return_lse", "return_lse_base_on_e"} <= params.keys()
 
 
 class DeepseekV4FlashInferSM90SparseBackend(DeepseekV4SparseMLABackend):
@@ -192,6 +169,15 @@ class DeepseekV4FlashInferSM90SparseBackend(DeepseekV4SparseMLABackend):
     ) -> str | None:
         if device_capability.major != 9:
             return "FLASHINFER_MLA_SPARSE_DSV41_SM90 requires SM90"
+        if head_size != 512:
+            return "FLASHINFER_MLA_SPARSE_DSV41_SM90 requires head_dim=512"
+        if not use_mla or not use_sparse:
+            return "FLASHINFER_MLA_SPARSE_DSV41_SM90 requires sparse MLA"
+        if kv_cache_dtype not in (None, "auto", "bfloat16", "fp8", "fp8_e4m3"):
+            return (
+                "FLASHINFER_MLA_SPARSE_DSV41_SM90 uses plain per-tensor "
+                "FP8/bf16 KV, not fp8_ds_mla"
+            )
         if not has_flashinfer_sm90_nope_mla():
             return (
                 "FLASHINFER_MLA_SPARSE_DSV41_SM90 requires FlashInfer with "
@@ -204,26 +190,6 @@ class DeepseekV4FlashInferSM90SparseBackend(DeepseekV4SparseMLABackend):
                 "BatchMLAPagedAttentionWrapper.run(return_lse=True) for the "
                 "two-call LSE merge; upgrade FlashInfer"
             )
-        if not use_sparse:
-            return "FLASHINFER_MLA_SPARSE_DSV41_SM90 requires sparse MLA"
-        if kv_cache_dtype not in (None, "auto", "bfloat16", "fp8", "fp8_e4m3"):
-            # fp8_ds_mla is the FlashMLA-only UE8M0 packed layout.
-            return (
-                "FLASHINFER_MLA_SPARSE_DSV41_SM90 uses plain per-tensor "
-                "FP8/bf16 KV, not fp8_ds_mla"
-            )
-        from vllm.config import get_current_vllm_config
-
-        vllm_config = get_current_vllm_config()
-        if vllm_config.model_config is not None:
-            hf = vllm_config.model_config.hf_text_config
-            if hf.kv_lora_rank != 512:
-                return "FLASHINFER_MLA_SPARSE_DSV41_SM90 requires kv_lora_rank=512"
-            if hf.qk_rope_head_dim not in (0, 64):
-                return (
-                    "FLASHINFER_MLA_SPARSE_DSV41_SM90 requires qk_rope_head_dim "
-                    "in (0, 64)"
-                )
         return None
 
     @staticmethod
@@ -285,8 +251,6 @@ class DeepseekV4FlashInferSM90MetadataBuilder(DeepseekV4SparseMLAMetadataBuilder
         hf_config = vllm_config.model_config.hf_text_config
         assert hf_config.index_topk is not None
         self._index_topk = int(hf_config.index_topk)
-        self._async_scheduling = bool(vllm_config.scheduler_config.async_scheduling)
-        self._decode_threshold = _decode_threshold(vllm_config)
         self.state = _SM90State(
             device,
             attention_layer.n_local_heads,
@@ -301,16 +265,20 @@ class DeepseekV4FlashInferSM90MetadataBuilder(DeepseekV4SparseMLAMetadataBuilder
     def _topk_lens_host(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> tuple[int, torch.Tensor]:
-        rows = _host_rows(common_attn_metadata, self._async_scheduling)
-        if rows is None:
-            return 0, torch.zeros(0, dtype=torch.int32)
-        num_rows, positions, _seq_lens, _q_lens, _req_of_row = rows
-        # Valid compressed-row entries per token; padded rows have ctx 0.
-        ctx = positions + 1
-        lens = (torch.clamp(ctx, min=0) // self.compress_ratio).clamp_(
-            max=self._index_topk
-        )
-        return num_rows, lens.to(torch.int32)
+        cam = common_attn_metadata
+        num_rows = cam.num_actual_tokens
+        positions = cam.positions
+        if positions is None:
+            req_ids = cam.token_to_req_indices(self.req_id_per_token_buffer)
+            positions = (
+                cam.seq_lens[req_ids].to(torch.int64)
+                + torch.arange(num_rows, device=cam.seq_lens.device)
+                - cam.query_start_loc[req_ids + 1]
+            )
+        ctx = positions[:num_rows] + 1
+        lens = (ctx.clamp(min=0) // self.compress_ratio).clamp(max=self._index_topk)
+        lens = torch.where(cam.slot_mapping[:num_rows] >= 0, lens, 0)
+        return num_rows, lens.to(torch.int32).cpu()
 
     def build(
         self,
@@ -352,21 +320,17 @@ class DeepseekSparseSWAFlashInferSM90MetadataBuilder(
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._async_scheduling = bool(
-            self.vllm_config.scheduler_config.async_scheduling
-        )
         hf_config = self.vllm_config.model_config.hf_text_config
         self._max_image_tokens = (
             getattr(hf_config, "vision_max_n_token", 0)
             if getattr(hf_config, "vision_n_layers", 0) > 0
             else 0
         )
-        self._is_dspark = self.is_dspark
         # Wrapper rows use one fixed stride: the widest index width (the
         # non-causal DSpark decode width and/or the vision-widened prefill
         # width when present, else the window).
         width = self.window_size
-        if self._is_dspark:
+        if self.is_dspark:
             width = max(width, self.noncausal_index_width)
         if self._max_image_tokens > 0:
             # In-image bidirectional visibility widens prefill index rows to
@@ -389,29 +353,6 @@ class DeepseekSparseSWAFlashInferSM90MetadataBuilder(
             sm_scale=head_size**-0.5,
         )
 
-    def _swa_lens_host(
-        self, common_attn_metadata: CommonAttentionMetadata
-    ) -> tuple[int, torch.Tensor]:
-        """Exact per-row SWA lengths, mirroring the device index kernels:
-        causal rows see ``min(ctx, window)``; DSpark non-causal decode rows
-        (block-anchored) see ``min(seq_len, window + q_len)``."""
-        rows = _host_rows(common_attn_metadata, self._async_scheduling)
-        if rows is None:
-            return 0, torch.zeros(0, dtype=torch.int32)
-        num_rows, positions, seq_lens, q_lens, req_of_row = rows
-        non_causal = not common_attn_metadata.causal
-        if not non_causal:
-            lens = torch.clamp(positions + 1, min=0).clamp(max=self.window_size)
-            return num_rows, lens.to(torch.int32)
-        num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
-            common_attn_metadata, decode_threshold=self.decode_threshold
-        )
-        lens = torch.clamp(positions + 1, min=0).clamp(max=self.window_size)
-        if num_decode_tokens > 0:
-            per_req = torch.minimum(seq_lens, self.window_size + q_lens)
-            lens[:num_decode_tokens] = per_req[req_of_row[:num_decode_tokens]]
-        return num_rows, lens.to(torch.int32)
-
     def build(
         self,
         common_prefix_len: int,
@@ -419,21 +360,13 @@ class DeepseekSparseSWAFlashInferSM90MetadataBuilder(
         fast_build: bool = False,
     ) -> "DeepseekSparseSWAMetadata":
         metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
-        if self._max_image_tokens > 0 and metadata.prefill_left_visible is not None:
-            # Image spans present: the default builder already computed exact
-            # per-token SWA lens on device, including in-image bidirectional
-            # visibility. Reuse them for the host-side plan (one small D2H
-            # copy) instead of the text-only host formula.
-            num_rows = metadata.num_decode_tokens + metadata.num_prefill_tokens
-            swa_lens = torch.cat(
-                [
-                    metadata.decode_swa_lens[: metadata.num_decode_tokens],
-                    metadata.prefill_swa_lens[: metadata.num_prefill_tokens],
-                ]
-            ).to(torch.int32)
-            swa_lens = swa_lens.cpu()
-        else:
-            num_rows, swa_lens = self._swa_lens_host(common_attn_metadata)
+        # Reuse the index kernels' exact counts, including masked tokens,
+        # non-causal drafting and image spans. Copy only one int32 per row.
+        num_rows = metadata.num_decode_tokens + metadata.num_prefill_tokens
+        lengths = [metadata.decode_swa_lens]
+        if metadata.prefill_swa_lens is not None:
+            lengths.append(metadata.prefill_swa_lens)
+        swa_lens = torch.cat(lengths).cpu()
         self.state.plan(num_rows, swa_lens)
         metadata.flashinfer_sm90_swa_state = self.state
         return metadata

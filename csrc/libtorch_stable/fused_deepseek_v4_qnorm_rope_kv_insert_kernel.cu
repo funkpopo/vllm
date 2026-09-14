@@ -853,8 +853,11 @@ __global__ void fusedDeepseekV4FullCacheKernel(
           po1[i] = Converter::convert(
               make_float2(elements[8 + 2 * i], elements[8 + 2 * i + 1]));
         }
+        scalar_t_in* q_out = q_fp8_out == nullptr
+                                 ? q_inout
+                                 : reinterpret_cast<scalar_t_in*>(q_fp8_out);
         scalar_t_in* dst =
-            q_inout +
+            q_out +
             (static_cast<int64_t>(tokenIdx) * num_heads_q + slotIdx) * kHeadDim +
             dim_base;
         *reinterpret_cast<uint4*>(dst) = out0;
@@ -1118,7 +1121,7 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
 void fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
     torch::stable::Tensor const& q,                // [N, H, 512] bf16, read-only
     torch::stable::Tensor const& kv,               // [N, 512] bf16, read-only
-    torch::stable::Tensor& q_fp8,                  // [N, H, 512] fp8 e4m3
+    torch::stable::Tensor& q_fp8,                  // [N, H, 512] fp8 or q dtype
     torch::stable::Tensor& k_cache,                // [num_blocks, bs, 512] fp8
     torch::stable::Tensor const& slot_mapping,     // [num_tokens_insert] int64
     torch::stable::Tensor const& position_ids,     // [N] int64
@@ -1132,10 +1135,11 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
   STD_TORCH_CHECK(kv.device().is_cuda() && kv.is_contiguous(),
                   "kv must be contiguous CUDA");
   STD_TORCH_CHECK(q_fp8.device().is_cuda() && q_fp8.is_contiguous() &&
-                      q_fp8.scalar_type() == ScalarType::Float8_e4m3fn &&
+                      (q_fp8.scalar_type() == ScalarType::Float8_e4m3fn ||
+                       q_fp8.scalar_type() == q.scalar_type()) &&
                       q_fp8.dim() == 3 && q_fp8.size(0) == q.size(0) &&
                       q_fp8.size(1) == q.size(1) && q_fp8.size(2) == q.size(2),
-                  "q_fp8 must be a contiguous float8_e4m3fn tensor matching q");
+                  "q_fp8 must match q shape and be contiguous, with FP8 or q dtype");
   STD_TORCH_CHECK(k_cache.device().is_cuda(), "k_cache must be CUDA");
   STD_TORCH_CHECK(slot_mapping.device().is_cuda() &&
                       slot_mapping.scalar_type() == ScalarType::Long,
@@ -1181,6 +1185,26 @@ void fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
   VLLM_STABLE_DISPATCH_HALF_TYPES(
       q.scalar_type(),
       "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert", [&] {
+        if (q_fp8.scalar_type() != ScalarType::Float8_e4m3fn) {
+          vllm::deepseek_v4_fused_ops::launchFullCacheKernel<scalar_t, false,
+                                                             true>(
+              reinterpret_cast<scalar_t*>(
+                  const_cast<void*>(q.const_data_ptr())),
+              reinterpret_cast<uint8_t*>(q_fp8.mutable_data_ptr()),
+              q_fp8.stride(0), q_fp8.stride(1),
+              reinterpret_cast<scalar_t const*>(kv.const_data_ptr()),
+              reinterpret_cast<uint8_t*>(k_cache.mutable_data_ptr()),
+              slot_mapping.const_data_ptr<int64_t>(),
+              position_ids.const_data_ptr<int64_t>(),
+              cos_sin_cache.const_data_ptr<float>(),
+              fp8_scale.const_data_ptr<float>(), nullptr, static_cast<float>(eps),
+              num_tokens_full, num_tokens_insert, num_heads_q,
+              static_cast<int>(cache_block_size), k_cache.stride(0),
+              k_cache.stride(1), apply_q_norm,
+              "fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert",
+              stream);
+          return;
+        }
         vllm::deepseek_v4_fused_ops::launchFullCacheKernel<scalar_t, true,
                                                            true>(
             // q is read-only in the fp8 path (the kernel writes q_fp8); the

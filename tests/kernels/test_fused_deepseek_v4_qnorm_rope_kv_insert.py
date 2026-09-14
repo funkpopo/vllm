@@ -633,11 +633,14 @@ def _fp8_full_cache_reference(
 ):
     q_ref = rmsnorm_no_weight(q, eps) if apply_q_norm else q.float()
     q_ref = apply_rope_gptj_last_k(q_ref, positions, cos_sin_cache)
-    q_fp8.copy_(
-        torch.clamp(q_ref.float() * q_fp8_scale_inv, -FP8_MAX, FP8_MAX).to(
-            FP8_STORE_DTYPE
+    if q_fp8.dtype == torch.bfloat16:
+        q_fp8.copy_(q_ref)
+    else:
+        q_fp8.copy_(
+            torch.clamp(q_ref.float() * q_fp8_scale_inv, -FP8_MAX, FP8_MAX).to(
+                FP8_STORE_DTYPE
+            )
         )
-    )
 
     kv_ref = apply_rope_gptj_last_k(kv, positions, cos_sin_cache)
     valid = slot_mapping >= 0
@@ -680,6 +683,7 @@ def _bf16_full_cache_reference(
 @pytest.mark.parametrize("num_tokens", [4, 17])
 @pytest.mark.parametrize("n_heads", [8, 17])
 @pytest.mark.parametrize("positions_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("q_output_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
     "apply_q_norm",
     [
@@ -692,6 +696,7 @@ def test_full_cache_per_tensor_fp8_matches_reference(
     num_tokens: int,
     n_heads: int,
     positions_dtype: torch.dtype,
+    q_output_dtype: torch.dtype,
     apply_q_norm: bool | None,
 ):
     torch.manual_seed(4)
@@ -714,8 +719,10 @@ def test_full_cache_per_tensor_fp8_matches_reference(
     # References are encoded under the scheme the kernel actually writes
     # (FNUZ on gfx942); the kernel's own outputs must stay float8_e4m3fn-typed
     # because the op asserts that dtype.
-    q_fp8_ref = torch.empty_like(q, dtype=FP8_STORE_DTYPE)
-    q_fp8_fused = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+    q_fp8_ref = torch.empty_like(
+        q, dtype=torch.bfloat16 if q_output_dtype == torch.bfloat16 else FP8_STORE_DTYPE
+    )
+    q_fp8_fused = torch.empty_like(q, dtype=q_output_dtype)
     k_cache_ref = torch.zeros(
         num_blocks, block_size, HEAD_DIM, dtype=FP8_STORE_DTYPE, device=device
     )
@@ -737,8 +744,9 @@ def test_full_cache_per_tensor_fp8_matches_reference(
         q_fp8_scale_inv,
         apply_q_norm is not False,
     )
+    q_input = q.clone()
     _call_full_cache_fp8_fused(
-        q.clone(),
+        q_input,
         kv,
         q_fp8_fused,
         k_cache_fused,
@@ -755,9 +763,13 @@ def test_full_cache_per_tensor_fp8_matches_reference(
     # Q uses optional RMSNorm followed by RoPE in fp32 before fp8 quant. The
     # kernel and torch reference can land on opposite sides of an fp8
     # round-to-nearest tie, so allow <=1 fp8 ULP.
-    q_fused = _as_stored_fp8(q_fp8_fused)
-    q_max_ulp = int(fp8_ulp_distance(q_fused, q_fp8_ref).max().item())
-    assert q_max_ulp <= 1, f"Q fp8 differs by {q_max_ulp} ULP (>1)"
+    torch.testing.assert_close(q_input, q, rtol=0, atol=0)
+    if q_output_dtype == torch.bfloat16:
+        torch.testing.assert_close(q_fp8_fused, q_fp8_ref, rtol=1e-2, atol=1e-2)
+    else:
+        q_fused = _as_stored_fp8(q_fp8_fused)
+        q_max_ulp = int(fp8_ulp_distance(q_fused, q_fp8_ref).max().item())
+        assert q_max_ulp <= 1, f"Q fp8 differs by {q_max_ulp} ULP (>1)"
 
     # K-cache NoPE region [0, NOPE_DIM) is a deterministic per-tensor fp8 quant
     # of the (un-rotated) KV input, so it must be bit-identical. The RoPE region

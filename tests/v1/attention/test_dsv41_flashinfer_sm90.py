@@ -1,12 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CPU tests for the DeepSeek V4.1 FlashInfer SM90 backend wiring (no GPU).
+"""DSV4.1 SM90 cache addressing, exact planning lengths and attention parity.
 
-The FlashInfer wrappers, top-k conversion, and LSE merge are replaced by CPU
-recorders; the tests pin the two-call contract: SWA rows (decode + prefill)
-feed call A, converted global top-k rows feed call B, the partials merge via
-LSE rescaling, and the sink is applied as a post-correction. Also pins the
-host-side length formulas the builders plan with and the backend gates.
+CPU references exercise the two-call merge; SM90 cases use real FlashInfer.
 """
 
 from types import SimpleNamespace
@@ -25,8 +21,16 @@ from vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse_sm90 import (
     DeepseekV4FlashInferSM90MetadataBuilder,
     DeepseekV4FlashInferSM90SparseBackend,
 )
+
 # isort: on
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.attention.ops.merge_attn_states import _merge_attn_states_torch
+from vllm.v1.kv_cache_interface import (
+    KVCacheLayout,
+    KVCacheTensor,
+    MLAAttentionSpec,
+    create_kv_cache_views,
+)
 
 BLOCK = 512
 WINDOW = 64
@@ -141,11 +145,9 @@ def test_two_call_mixed_batch(monkeypatch):
         output.copy_(p_out + s_out)
 
     monkeypatch.setattr(fi_dsv41_mod, "merge_attn_states", fake_merge)
-    monkeypatch.setattr(
-        type(attn), "_apply_sink_correction", lambda self, o, l: None
-    )
+    monkeypatch.setattr(type(attn), "_apply_sink_correction", lambda self, out, lse: None)
 
-    q = torch.randn(num_tokens, NUM_HEADS, BLOCK)
+    q = torch.randn(num_tokens, NUM_HEADS, BLOCK, dtype=torch.bfloat16)
     output = torch.zeros_like(q)
     attn.forward_mqa(q, None, None, output)
 
@@ -186,7 +188,7 @@ def test_swa_only_single_call(monkeypatch):
         fi_dsv41_mod, "merge_attn_states", lambda *a, **k: merged_calls.append(a)
     )
 
-    q = torch.randn(ndt, NUM_HEADS, BLOCK)
+    q = torch.randn(ndt, NUM_HEADS, BLOCK, dtype=torch.bfloat16)
     output = torch.zeros_like(q)
     attn.forward_mqa(q, None, None, output)
 
@@ -206,7 +208,7 @@ def test_run_wrapper_args():
     attn, _ = make_attn(kv_dtype=torch.float8_e4m3fn)
     attn._sm90_ckv_scale = 0.5
     state = FakeState(TOPK)
-    q = torch.randn(5, NUM_HEADS, BLOCK)
+    q = torch.randn(5, NUM_HEADS, BLOCK, dtype=torch.bfloat16)
 
     attn._run_wrapper(state, q, attn.kv_cache.reshape(-1, 1, BLOCK))
 
@@ -223,97 +225,68 @@ def test_run_wrapper_args():
 
 def _make_builder(cls, **attrs):
     builder = object.__new__(cls)
-    builder._async_scheduling = False
     for key, value in attrs.items():
         setattr(builder, key, value)
     return builder
 
 
-def test_swa_lens_host_causal():
-    builder = _make_builder(
-        DeepseekSparseSWAFlashInferSM90MetadataBuilder,
-        _is_dspark=False,
-        window_size=WINDOW,
-        decode_threshold=1,
-    )
-    cam = SimpleNamespace(
-        num_reqs=3,
-        query_start_loc_cpu=torch.tensor([0, 5, 7, 10], dtype=torch.int32),
-        seq_lens=torch.tensor([100, 9, 3000], dtype=torch.int32),
-        seq_lens_cpu_upper_bound=torch.tensor([100, 9, 3000], dtype=torch.int32),
-        positions=None,
-        causal=True,
-    )
-    num_rows, lens = builder._swa_lens_host(cam)
-    assert num_rows == 10
-    # ctx 96..100, 8..9, 2998..3000 all clamped to the window.
-    assert lens.tolist() == [WINDOW] * 5 + [8, 9] + [WINDOW] * 3
-
-
-def test_swa_lens_host_noncausal_dspark():
-    builder = _make_builder(
-        DeepseekSparseSWAFlashInferSM90MetadataBuilder,
-        _is_dspark=True,
-        window_size=WINDOW,
-        decode_threshold=6,
-    )
-    cam = SimpleNamespace(
-        num_reqs=2,
-        num_actual_tokens=12,
-        max_query_len=6,
-        query_start_loc_cpu=torch.tensor([0, 6, 12], dtype=torch.int32),
-        seq_lens=torch.tensor([100, 9], dtype=torch.int32),
-        seq_lens_cpu_upper_bound=torch.tensor([100, 9], dtype=torch.int32),
-        positions=None,
-        causal=False,
-    )
-    num_rows, lens = builder._swa_lens_host(cam)
-    assert num_rows == 12
-    # Non-causal decode rows (block-anchored): min(seq_len, window + q_len)
-    # = min(100, 70) for req0, min(9, 70) for req1.
-    assert lens[:6].tolist() == [70] * 6
-    assert lens[6:].tolist() == [9] * 6
-
-
-def test_topk_lens_host_ratio1():
-    builder = _make_builder(
-        DeepseekV4FlashInferSM90MetadataBuilder,
-        _index_topk=2048,
-        _async_scheduling=False,
-        compress_ratio=1,
-    )
-    cam = SimpleNamespace(
-        num_reqs=2,
-        query_start_loc_cpu=torch.tensor([0, 5, 10], dtype=torch.int32),
-        seq_lens=torch.tensor([100, 3000], dtype=torch.int32),
-        seq_lens_cpu_upper_bound=torch.tensor([100, 3000], dtype=torch.int32),
-        positions=None,
-    )
-    _num_rows, lens = builder._topk_lens_host(cam)
-    # ctx 96..100, 2996..3000; cr=1: min(topk, ctx // 1)
-    assert lens.tolist() == [96, 97, 98, 99, 100, 2048, 2048, 2048, 2048, 2048]
-
-
-def test_topk_lens_host_ratio2():
+@pytest.mark.parametrize("compress_ratio", [1, 2])
+@pytest.mark.parametrize("with_positions", [False, True])
+def test_topk_lengths_use_device_boundaries_and_mask_padding(
+    compress_ratio, with_positions
+):
     builder = _make_builder(
         DeepseekV4FlashInferSM90MetadataBuilder,
         _index_topk=8,
-        _async_scheduling=False,
-        compress_ratio=2,
+        compress_ratio=compress_ratio,
+        req_id_per_token_buffer=torch.empty(6, dtype=torch.int32),
     )
+    # CPU boundaries and optimistic lengths deliberately differ from the device.
+    positions = torch.tensor([0, 1, 16, 17, 18, 19])
     cam = SimpleNamespace(
-        num_reqs=1,
-        query_start_loc_cpu=torch.tensor([0, 3], dtype=torch.int32),
-        seq_lens=torch.tensor([40], dtype=torch.int32),
-        seq_lens_cpu_upper_bound=torch.tensor([40], dtype=torch.int32),
-        positions=None,
+        num_actual_tokens=6,
+        num_reqs=2,
+        query_start_loc_cpu=torch.tensor([0, 3, 6], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 2, 6], dtype=torch.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([5, 23], dtype=torch.int32),
+        seq_lens=torch.tensor([2, 20], dtype=torch.int32),
+        positions=positions if with_positions else None,
+        slot_mapping=torch.tensor([0, 1, 2, 3, 4, -1]),
+        token_to_req_indices=lambda buffer: torch.tensor([0, 0, 1, 1, 1, 1]),
     )
-    # cr=2: candidates == ctx // 2 -> 19, 20, 20, all clamped to topk=8.
-    _num_rows, lens = builder._topk_lens_host(cam)
-    assert lens.tolist() == [8, 8, 8]
+    num_rows, lens = builder._topk_lens_host(cam)
+    assert num_rows == 6
+    assert lens.tolist() == (
+        [1, 2, 8, 8, 8, 0] if compress_ratio == 1 else [0, 1, 8, 8, 8, 0]
+    )
 
 
-def test_backend_gates():
+@pytest.mark.parametrize("prefill_lens", [None, [4, 80, 0]])
+def test_swa_plan_uses_index_kernel_lengths(monkeypatch, prefill_lens):
+    metadata = SimpleNamespace(
+        num_decode_tokens=2,
+        num_prefill_tokens=0 if prefill_lens is None else len(prefill_lens),
+        decode_swa_lens=torch.tensor([69, 0], dtype=torch.int32),
+        prefill_swa_lens=(
+            None
+            if prefill_lens is None
+            else torch.tensor(prefill_lens, dtype=torch.int32)
+        ),
+    )
+    builder_cls = DeepseekSparseSWAFlashInferSM90MetadataBuilder
+    monkeypatch.setattr(builder_cls.__bases__[0], "build", lambda *a: metadata)
+    calls = []
+    state = SimpleNamespace(plan=lambda n, lens: calls.append((n, lens)))
+    builder = _make_builder(builder_cls, state=state)
+    result = builder.build(0, None)
+    assert result.flashinfer_sm90_swa_state is state
+    expected = [69, 0] + (prefill_lens or [])
+    assert calls[0][0] == len(expected)
+    assert calls[0][1].tolist() == expected
+    assert calls[0][1].device.type == "cpu"
+
+
+def test_backend_gates(monkeypatch):
     backend = DeepseekV4FlashInferSM90SparseBackend
     assert backend.supports_compute_capability(SimpleNamespace(major=9))
     assert not backend.supports_compute_capability(SimpleNamespace(major=10))
@@ -330,6 +303,12 @@ def test_backend_gates():
         use_mm_prefix=False,
         device_capability=SimpleNamespace(major=major),
     )
+    import vllm.models.deepseek_v4_1.nvidia.flashinfer_sparse_sm90 as backend_mod
+
+    monkeypatch.setattr(backend_mod, "has_flashinfer_sm90_nope_mla", lambda: True)
+    monkeypatch.setattr(backend_mod, "has_flashinfer_sm90_mla_lse", lambda: True)
+    # No V3 kv_lora_rank field or active VllmConfig is needed for full-row NoPE.
+    assert call() is None
     assert "SM90" in (call(major=10) or "")
     assert "fp8_ds_mla" in (call(kv="fp8_ds_mla") or "")
 
@@ -362,6 +341,153 @@ def test_dtype_canonicalization():
     )
     # Base class leaves values untouched.
     assert DeepseekV4Attention._canonicalize_kv_cache_dtype("auto", None) == "auto"
+    with pytest.raises(ValueError, match="plain BF16/FP8"):
+        DeepseekV4FlashInferSM90Attention._canonicalize_kv_cache_dtype(
+            "fp8_ds_mla", None
+        )
+
+
+def make_packed_cache(dtype, block_size, device="cpu"):
+    spec = MLAAttentionSpec(
+        block_size=block_size, num_kv_heads=1, head_size=BLOCK, dtype=dtype
+    )
+    page_bytes = block_size * BLOCK * dtype.itemsize
+    stride = page_bytes + 512
+    raw = torch.zeros(3 * stride, dtype=torch.int8, device=device)
+    tensor = KVCacheTensor(
+        size=raw.numel(),
+        layers=["kv"],
+        layer_stride=page_bytes,
+        block_stride=stride,
+        offset=512,
+    )
+    cache = create_kv_cache_views(raw, spec, 3, KVCacheLayout.BLHNC, tensor)[0]
+    cache = cache.squeeze(1)
+    cache.copy_(torch.randn(cache.shape, device=device).to(dtype))
+    return cache
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_interleaved_cache_page_indices_alias_original_rows(dtype):
+    attn, _ = make_attn(dtype)
+    cache = make_packed_cache(dtype, 32)
+    assert not cache.is_contiguous()
+    ckv, block_stride, token_stride = attn._flat_ckv(cache)
+    assert ckv.untyped_storage().data_ptr() == cache.untyped_storage().data_ptr()
+    slots = torch.tensor([[0, 31, 32, 63, 95, -1]], dtype=torch.int32)
+    indices = torch.empty_like(slots)
+    attn._copy_page_indices(indices, slots, 32, block_stride, token_stride)
+    selected = ckv.float()[indices.long(), 0]
+    logical = slots.clamp(min=0).long()
+    expected = cache.float()[logical // 32, logical % 32]
+    torch.testing.assert_close(selected, expected, rtol=0, atol=0)
+
+
+class ReferenceWrapper:
+    """Compute partial attention from the pages passed by forward_mqa."""
+
+    def __init__(self, state, lengths):
+        self.state = state
+        self.lengths = lengths
+
+    def run(self, q, q_pe, ckv, kpe, **kwargs):
+        out = torch.zeros_like(q)
+        lse = torch.full(q.shape[:2], -torch.inf, device=q.device)
+        indices = self.state.kv_indices.view(-1, self.state.topk_width)
+        for row, length in enumerate(self.lengths):
+            if length == 0:
+                continue
+            kv = ckv.float()[indices[row, :length].long(), 0]
+            logits = q[row].float() @ kv.T * BLOCK**-0.5
+            out[row] = (logits.softmax(-1) @ kv).to(out.dtype)
+            lse[row] = logits.logsumexp(-1)
+        return out, lse
+
+
+@pytest.mark.parametrize("compress_ratio", [0, 1, 2])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("use_flashinfer", [False, True], ids=["cpu", "sm90"])
+def test_interleaved_two_call_attention_matches_joint_softmax(
+    monkeypatch, compress_ratio, dtype, use_flashinfer
+):
+    if use_flashinfer:
+        if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+            pytest.skip("requires SM90")
+        pytest.importorskip("flashinfer")
+        from vllm.v1.attention.backends.mla.flashinfer_mla_sparse_sm90 import _SM90State
+
+    device = "cuda" if use_flashinfer else "cpu"
+    torch.manual_seed(0)
+    attn, swa_layer = make_attn(dtype)
+    attn.compress_ratio = compress_ratio
+    swa_layer.kv_cache = make_packed_cache(dtype, 32, device)
+    block_size = 64 // max(compress_ratio, 1)
+    attn.kv_cache = make_packed_cache(dtype, block_size, device)
+    attn.attn_sink = torch.tensor([-torch.inf, -2.0, 0.5, 3.0], device=device)
+    # Equal token/head counts detect ambiguous LSE transposes; the final row is padding.
+    q = torch.randn(4, NUM_HEADS, BLOCK, dtype=torch.bfloat16, device=device)
+    slots_a = torch.tensor(
+        [[0, 31, 32], [1, 33, 95], [0, 32, 64], [-1, -1, -1]],
+        dtype=torch.int32,
+        device=device,
+    )
+    slots_b = torch.tensor(
+        [[-1, -1], [0, block_size], [block_size - 1, 2 * block_size], [-1, -1]],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    def state_for(width, lengths):
+        if use_flashinfer:
+            state = _SM90State(
+                torch.device(device), NUM_HEADS, dtype, 4, width, BLOCK, 0, BLOCK**-0.5
+            )
+            state.plan(4, torch.tensor(lengths, dtype=torch.int32))
+        else:
+            state = FakeState(width)
+            state.wrapper = ReferenceWrapper(state, lengths)
+        return state
+
+    swa_metadata = make_swa_metadata(2, 2, width=3)
+    swa_metadata.decode_swa_indices = slots_a[:2].unsqueeze(1)
+    swa_metadata.prefill_swa_indices = slots_a[2:].unsqueeze(1)
+    swa_metadata.flashinfer_sm90_swa_state = state_for(3, [3, 3, 3, 0])
+    topk_state = state_for(2, [0, 2, 2, 0]) if compress_ratio else None
+    metadata = {
+        swa_layer.prefix: swa_metadata,
+        attn.compressed_cache_prefix: SimpleNamespace(
+            num_reqs=2,
+            block_size=64,
+            block_table=torch.zeros(2, 3),
+            flashinfer_sm90_topk_state=topk_state,
+        ),
+    }
+    monkeypatch.setattr(
+        fi_dsv41_mod,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata=metadata),
+    )
+    monkeypatch.setattr(
+        fi_dsv41_mod, "compute_global_topk_indices_and_lens", lambda *a: (slots_b, None)
+    )
+    if not use_flashinfer:
+        monkeypatch.setattr(fi_dsv41_mod, "merge_attn_states", _merge_attn_states_torch)
+    output = torch.empty_like(q)
+    attn.forward_mqa(q, None, None, output)
+
+    expected = torch.zeros_like(q)
+    for row in range(3):
+        swa_slots = slots_a[row].long()
+        kv = swa_layer.kv_cache.float()[swa_slots // 32, swa_slots % 32]
+        if compress_ratio:
+            topk = slots_b[row][slots_b[row] >= 0].long()
+            kv = torch.cat(
+                [kv, attn.kv_cache.float()[topk // block_size, topk % block_size]]
+            )
+        logits = q[row].float() @ kv.T * BLOCK**-0.5
+        weights = torch.cat([logits, attn.attn_sink[:, None]], dim=-1).softmax(-1)
+        expected[row] = (weights[:, :-1] @ kv).to(q.dtype)
+    torch.testing.assert_close(output, expected, rtol=2e-2, atol=1e-2)
 
 
 def test_selection_logic(monkeypatch):

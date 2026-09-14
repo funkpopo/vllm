@@ -168,6 +168,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     # bf16 / per-tensor fp8 KV row. Backends can override the instance hook when
     # a single attention class dispatches across arch-specific layouts.
     use_fp8_ds_mla_layout: ClassVar[bool] = True
+    # Query output dtype for the plain FP8 cache insert kernel.
+    fp8_cache_query_dtype: ClassVar[torch.dtype] = torch.float8_e4m3fn
     # Prefill is processed in fixed-size chunks; this bounds the bf16 kv-gather
     # workspace allocated in _forward_prefill and is also read by the dummy-run
     # path to pre-reserve that workspace.
@@ -916,8 +918,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             )
             return q
 
-        # per-tensor fp8 (torch.float8_e4m3fn)
-        q_fp8 = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+        # FP8 caches can retain BF16 queries for backends that require them.
+        q_fp8 = torch.empty_like(q, dtype=self.fp8_cache_query_dtype)
         torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
             q,
             kv,
