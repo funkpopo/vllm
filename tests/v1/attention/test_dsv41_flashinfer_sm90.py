@@ -65,6 +65,7 @@ def make_attn(kv_dtype=torch.bfloat16):
     attn._sm90_ckv_scale = 1.0
     attn.topk_indices_buffer = torch.full((64, TOPK), -1, dtype=torch.int32)
     attn.kv_cache = torch.zeros(8, 32, BLOCK, dtype=kv_dtype)
+    attn.attn_sink = torch.zeros(NUM_HEADS, dtype=torch.float32)
     attn.is_kv_source = True
     attn.compressed_cache_prefix = "l0.attn"
     attn._static_forward_context = {"l0.attn": attn}
@@ -152,9 +153,11 @@ def test_two_call_mixed_batch(monkeypatch):
     rows_a = swa_state.kv_indices.view(-1, swa_state.topk_width)[:num_tokens]
     assert torch.equal(rows_a[:ndt], swa_metadata.decode_swa_indices.reshape(ndt, -1))
     assert torch.equal(rows_a[ndt:], swa_metadata.prefill_swa_indices.reshape(npt, -1))
-    # Call B: the converted global top-k rows.
+    # Call B: the converted global top-k rows (masked tails clamped to a
+    # valid slot by the forward, as planned rows never read past their
+    # per-row length).
     rows_b = topk_state.kv_indices.view(-1, TOPK)[:num_tokens]
-    assert torch.equal(rows_b, fake_topk)
+    assert torch.equal(rows_b, fake_topk.clamp_(min=0))
 
     swa_run = swa_state.wrapper.run_calls[0]
     topk_run = topk_state.wrapper.run_calls[0]
@@ -206,7 +209,12 @@ def test_run_wrapper_args():
     q_nope, q_pe, ckv, kpe, kwargs = state.wrapper.run_calls[0]
     assert q_nope.shape == (5, NUM_HEADS, BLOCK) and q_pe.shape == (5, NUM_HEADS, 0)
     assert ckv.shape == (8 * 32, 1, BLOCK) and kpe.shape[-1] == 0
-    assert kwargs == {"ckv_scale": 0.5, "kpe_scale": 1.0}
+    assert kwargs == {
+        "return_lse": True,
+        "return_lse_base_on_e": True,
+        "ckv_scale": 0.5,
+        "kpe_scale": 1.0,
+    }
 
 
 def _make_builder(cls, **attrs):
@@ -247,6 +255,7 @@ def test_swa_lens_host_noncausal_dspark():
     )
     cam = SimpleNamespace(
         num_reqs=2,
+        num_actual_tokens=12,
         max_query_len=6,
         query_start_loc_cpu=torch.tensor([0, 6, 12], dtype=torch.int32),
         seq_lens=torch.tensor([100, 9], dtype=torch.int32),

@@ -303,8 +303,8 @@ class DeepseekV4FlashInferSM90MetadataBuilder(DeepseekV4SparseMLAMetadataBuilder
         num_rows, positions, _seq_lens, _q_lens, _req_of_row = rows
         # Valid compressed-row entries per token; padded rows have ctx 0.
         ctx = positions + 1
-        lens = torch.minimum(
-            torch.clamp(ctx, min=0) // self.compress_ratio, self._index_topk
+        lens = (torch.clamp(ctx, min=0) // self.compress_ratio).clamp_(
+            max=self._index_topk
         )
         return num_rows, lens.to(torch.int32)
 
